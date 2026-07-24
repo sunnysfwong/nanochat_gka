@@ -43,6 +43,8 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+# parser.add_argument("--compile", action="store_true", help="use torch.compile to speed up training (highly recommended if available, but can cause issues in some environments)")
+parser.add_argument("--not-compile", action="store_true", help="disable torch.compile even if available")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -55,7 +57,7 @@ parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding 
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
-parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
+parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
 parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
@@ -75,6 +77,8 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--log-every", type=int, default=50, help="log training metrics to wandb every N steps")
+parser.add_argument("--early-stop", type=int, default=-1, help="early stop the run at step N (-1 = disable)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -154,6 +158,7 @@ model.init_weights() # 3) All tensors get initialized
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+# checkpoint_dir = os.path.join(google_drive_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
@@ -218,13 +223,12 @@ def disable_fp8(model):
         return
 
     # Swap Float8Linear -> Linear (our custom class that casts weights to match input dtype)
-    # Use device="meta" to avoid VRAM spike - the weight tensor will be swapped in afterwards
     for parent, attr_name, fp8_module in fp8_locations:
         linear = Linear(
             fp8_module.in_features,
             fp8_module.out_features,
             bias=fp8_module.bias is not None,
-            device="meta",  # Use meta device to avoid unnecessary VRAM allocation
+            device=fp8_module.weight.device,
             dtype=fp8_module.weight.dtype,
         )
         linear.weight = fp8_module.weight  # share, don't copy
@@ -243,7 +247,8 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if not args.not_compile:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -367,6 +372,7 @@ def get_lr_multiplier(it):
     else:
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        # return math.exp((1-progress) * math.log(args.final_lr_frac)) # exponential decay to final_lr_frac
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
@@ -414,7 +420,7 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 
 # Go!
 while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    last_step = (step == num_iterations) or (step == args.early_stop) # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
@@ -555,16 +561,18 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     # Calculate ETA based on average time per step (excluding first 10 steps)
-    steps_done = step - 10
-    if steps_done > 0:
-        avg_time_per_step = total_training_time / steps_done
-        remaining_steps = num_iterations - step
-        eta_seconds = remaining_steps * avg_time_per_step
-        eta_str = f" | eta: {eta_seconds/60:.1f}m"
-    else:
-        eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    
+    if (step % args.log_every == 0) or last_step:
+        steps_done = step - 10
+        if steps_done > 0:
+            avg_time_per_step = total_training_time / steps_done
+            remaining_steps = num_iterations - step
+            eta_seconds = remaining_steps * avg_time_per_step
+            eta_str = f" | eta: {eta_seconds/60:.1f}m"
+        else:
+            eta_str = ""
+        epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+        print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,

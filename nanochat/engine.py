@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
+from nanochat.gpt import StateCache
 
 # -----------------------------------------------------------------------------
 # Calculator tool helpers
@@ -79,6 +80,8 @@ def use_calculator(expr):
     return eval_with_timeout(expr)
 
 # -----------------------------------------------------------------------------
+
+
 class KVCache:
     """
     KV Cache designed for Flash Attention 3's flash_attn_with_kvcache API.
@@ -198,29 +201,31 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
+        model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        state_cache = StateCache(
             batch_size=1,
             seq_len=len(tokens),
             device=device,
             dtype=dtype,
-            **kv_model_kwargs,
+            **model_kwargs,
         )
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        ids = torch.tensor([tokens], dtype=torch.long, device=device) # (1, T)
+        B, T = ids.shape
+        for t in range(T):
+            logits = self.model.forward(ids[:, t:t+1], state_cache=state_cache)
         logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
 
-        # 2) Replicate the KV cache for each sample/row
-        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
+        # 2) Replicate the State cache for each sample/row
+        state_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        state_cache_decode = StateCache(
             batch_size=num_samples,
-            seq_len=kv_length_hint,
+            seq_len=state_length_hint,
             device=device,
             dtype=dtype,
-            **kv_model_kwargs,
+            **model_kwargs,
         )
-        kv_cache_decode.prefill(kv_cache_prefill)
-        del kv_cache_prefill # no need to keep this memory around
+        state_cache_decode.prefill(state_cache)
+        del state_cache # no need to keep this memory around
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
@@ -277,7 +282,7 @@ class Engine:
 
             # Prepare logits for next iteration
             ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            logits = self.model.forward(ids, state_cache=state_cache_decode)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

@@ -21,9 +21,68 @@ import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.gated_kernel_attention import gated_kernel_attention, gated_kernel_attention_recurrent
+# from nanochat.sqrelu_attn import sqrelu_attn
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
-from nanochat.flash_attention import flash_attn
+# from nanochat.flash_attention import flash_attn
+
+class StateCache:
+    """
+    State Cache for custom attention
+    """
+
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
+        self.batch_size = batch_size
+        self.max_seq_len = seq_len
+        self.n_layers = num_layers
+        self.n_heads = num_heads
+        self.head_dim = head_dim
+        # Pre-allocate cache tensors: (n_layers, B, H, 2*D, D or 1)
+        self.num_cache = torch.zeros(num_layers, batch_size, num_heads, head_dim, head_dim, device=device, dtype=torch.float32)
+        self.den_cache = torch.zeros(num_layers, batch_size, num_heads, head_dim, 1, device=device, dtype=torch.float32)
+        # Previous token's normalized embedding for smear (set by model forward pass)
+        self.prev_embedding = None
+        self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+    def reset(self):
+        """Reset cache to empty state."""
+        self.cache_seqlens.zero_()
+        self.prev_embedding = None
+
+    def get_pos(self):
+        """Get current position (assumes all batch elements at same position)."""
+        return self.cache_seqlens[0].item()
+
+    def get_layer_cache(self, layer_idx):
+        """Return (num_cache, den_cache) views for a specific layer."""
+        return self.num_cache[layer_idx], self.den_cache[layer_idx]
+    
+    @torch.no_grad()
+    def update_layer_cache(self, layer_idx, num_cache, den_cache):
+        """Set the cache for a specific layer."""
+        self.num_cache[layer_idx].copy_(num_cache)
+        self.den_cache[layer_idx].copy_(den_cache)
+
+    def advance(self, num_tokens):
+        """Advance the cache position by num_tokens."""
+        self.cache_seqlens += num_tokens
+
+    def prefill(self, other):
+        """
+        Copy cached KV from another cache into this one.
+        Used when we do batch=1 prefill and then want to generate multiple samples in parallel.
+        """
+        assert self.get_pos() == 0, "Cannot prefill a non-empty KV cache"
+        assert self.n_layers == other.n_layers and self.n_heads == other.n_heads and self.head_dim == other.head_dim
+        assert self.max_seq_len >= other.max_seq_len
+        other_pos = other.get_pos()
+        self.num_cache = other.num_cache.expand(-1, self.batch_size, -1, -1, -1).clone()
+        self.den_cache = other.den_cache.expand(-1, self.batch_size, -1, -1, -1).clone()
+        self.cache_seqlens.fill_(other_pos)
+        # Copy smear state: expand batch=1 prev_embedding to num_samples
+        if other.prev_embedding is not None:
+            self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
 
 @dataclass
 class GPTConfig:
@@ -49,6 +108,21 @@ class Linear(nn.Linear):
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
+class MySqRelu(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inp):
+        relu = inp.relu()
+        ctx.save_for_backward(relu)
+        return relu.square()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        relu, = ctx.saved_tensors
+        grad_input = grad_output * 2 * relu
+        return grad_input
+    
+def my_sqrelu(inp: torch.Tensor) -> torch.Tensor:
+    return MySqRelu.apply(inp)
 
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
@@ -62,6 +136,120 @@ def apply_rotary_emb(x, cos, sin):
     y2 = x1 * (-sin) + x2 * cos
     return torch.cat([y1, y2], 3)
 
+def act_f(f: torch.Tensor, f_bias: torch.Tensor) -> torch.Tensor:
+    return F.sigmoid(f.float() + f_bias)*4
+
+class CausalSelfLinearAttention(nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.n_head = config.n_head
+        self.n_kv_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        assert self.n_embd % self.n_head == 0
+        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
+        self.c_q = Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_f = Linear(self.n_embd, self.n_kv_head, bias=False) 
+        self.c_beta = Linear(self.n_embd, self.n_embd, bias=False) 
+        self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
+        self.ve_gate_channels = 12
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        # self.A = nn.Parameter(torch.zeros(self.n_kv_head, 1, 1, dtype=torch.float32)) # head-specific projection for keys in attention kernel (like MLP mixing, but only on keys and with a single shared projection per head instead of per layer)
+        self.f_bias = nn.Parameter(torch.zeros(self.n_kv_head, 1, 1, dtype=torch.float32)) # head-specific projection for keys in attention kernel (like MLP mixing, but only on keys and with a single shared projection per head instead of per layer)
+        self.o_norm = nn.RMSNorm(self.head_dim, eps=1e-3, elementwise_affine=True, dtype=COMPUTE_DTYPE)
+
+    def init_weights(self):
+        n_embd = self.n_embd
+        s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        torch.nn.init.uniform_(self.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+        torch.nn.init.uniform_(self.c_k.weight, -s, s)
+        torch.nn.init.uniform_(self.c_v.weight, -s, s)
+        torch.nn.init.uniform_(self.c_f.weight, -s, s)
+        torch.nn.init.uniform_(self.c_beta.weight, -s, s)
+        torch.nn.init.zeros_(self.c_proj.weight) # projections are zero
+        # nn.init.uniform_(self.A, 0., 4.)
+        nn.init.constant_(self.f_bias, -4.)
+        nn.init.ones_(self.o_norm.weight)
+
+        # Gate weights init with small positive values so gates start slightly above neutral
+        if self.ve_gate is not None:
+            torch.nn.init.uniform_(self.ve_gate.weight, 0.0, 0.02)
+
+    def optim_param_groups(self):
+        return {
+            'muon': 
+                list(self.c_q.parameters())+
+                list(self.c_k.parameters())+
+                list(self.c_v.parameters())+
+                list(self.c_f.parameters())+
+                list(self.c_beta.parameters())+
+                list(self.c_proj.parameters())+
+                (list(self.ve_gate.parameters()) if self.ve_gate is not None else [])
+            ,
+            'adamw': [
+                # self.A.data, 
+                self.f_bias.data,
+            ]+list(self.o_norm.parameters()),
+        }
+    
+    def forward(self, x, ve, cos_sin, window_size, state_cache):
+        B, T, C = x.size()
+
+        # Project the input to get queries, keys, and values
+        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
+        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
+        f = self.c_f(x).view(B, T, self.n_head, 1)
+        beta = self.c_beta(x).view(B, T, self.n_head, self.head_dim)
+
+
+        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        if ve is not None:
+            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            gate = 3 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 3)
+            v = v + gate.unsqueeze(-1) * ve
+
+        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        # cos, sin = cos_sin
+        # q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        # q, k = norm(q), norm(k) # QK norm
+        # q = q * 1.2  # sharper attention (split scale between Q and K), TODO think through better
+        # k = k * 1.2
+
+        q = q.transpose(1, 2) # (B, H, T, D)
+        k = k.transpose(1, 2) # (B, H, T, D)
+        v = v.transpose(1, 2) # (B, H, T, D)
+        f = f.transpose(1, 2) # (B, H, T, 1)
+        beta = beta.transpose(1, 2) # (B, H, T, 1)
+        beta = F.sigmoid(beta.float()).to(x.dtype)
+        f_bias = self.f_bias
+        g = act_f(f, f_bias)
+
+        # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
+        # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
+        if state_cache is None:
+            y_ = gated_kernel_attention(q, k, v, g)
+            v_unit = F.normalize(v, dim=-1)
+            y_ = y_ - (torch.sum(y_ * v_unit, dim=-1, keepdim=True)*2.) * (v_unit * beta)
+            y = y_.transpose(1, 2)
+        else:
+            assert T == 1
+            num_cache, den_cache = state_cache.get_layer_cache(self.layer_idx)
+            y_, num_cache, den_cache = gated_kernel_attention_recurrent(q, k, v, g, num_cache, den_cache)
+            state_cache.update_layer_cache(self.layer_idx, num_cache, den_cache)
+            v_unit = F.normalize(v, dim=-1)
+            y_ = y_ - (torch.sum(y_ * v_unit, dim=-1, keepdim=True)*2.) * (v_unit * beta)
+            y = y_.transpose(1, 2)
+        y = self.o_norm(y)
+        # Re-assemble the heads and project back to residual stream
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+    
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -79,6 +267,28 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 12
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
+    def init_weights(self):
+        n_embd = self.n_embd
+        s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        torch.nn.init.uniform_(self.c_q.weight, -s, s) # weights use Uniform to avoid outliers
+        torch.nn.init.uniform_(self.c_k.weight, -s, s)
+        torch.nn.init.uniform_(self.c_v.weight, -s, s)
+        torch.nn.init.zeros_(self.c_proj.weight) # projections are zero
+
+        # Gate weights init with small positive values so gates start slightly above neutral
+        if self.ve_gate is not None:
+            torch.nn.init.uniform_(self.ve_gate.weight, 0.0, 0.02)
+
+    def optim_param_groups(self):
+        return {
+            'muon': 
+                list(self.c_q.parameters())+
+                list(self.c_k.parameters())+
+                list(self.c_v.parameters())+
+                list(self.c_proj.parameters())+
+                (list(self.ve_gate.parameters()) if self.ve_gate is not None else [])
+        }
+    
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
@@ -105,9 +315,15 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # y = sqrelu_attn(q, k, v)
+            y = y.transpose(1, 2)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
+            raise NotImplementedError()
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
@@ -125,28 +341,85 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
+class MLPFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, c_fc_weight, c_proj_weight):
+        c_fc_weight = c_fc_weight.to(dtype=x.dtype)
+        c_proj_weight = c_proj_weight.to(dtype=x.dtype)
+        ctx.save_for_backward(x, c_fc_weight, c_proj_weight)
+        x = F.linear(x, c_fc_weight)
+        x = F.relu(x).square()
+        x = F.linear(x, c_proj_weight)
+        return x
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, c_fc_weight, c_proj_weight = ctx.saved_tensors
+
+        relu_x = F.relu(F.linear(x, c_fc_weight))
+
+        # Backprop through the second linear layer
+        grad_x_proj = F.linear(grad_output, c_proj_weight.T)
+        grad_c_proj_weight = torch.einsum('...i,...j->ji', relu_x.square(), grad_output)
+
+        # Backprop through the ReLU^2 activation
+        grad_relu = grad_x_proj * 2 * relu_x
+
+        # Backprop through the first linear layer
+        grad_input = F.linear(grad_relu, c_fc_weight.T)
+        grad_c_fc_weight = torch.einsum('...i,...j->ji', x, grad_relu)
+
+        return grad_input, grad_c_fc_weight, grad_c_proj_weight
+    
+def mlp_forward(x, c_fc_weight, c_proj_weight):
+    return MLPFunction.apply(x, c_fc_weight, c_proj_weight)
 
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.n_embd = config.n_embd
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
 
+    def init_weights(self):
+        n_embd = self.n_embd
+        s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+        torch.nn.init.uniform_(self.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
+        torch.nn.init.zeros_(self.c_proj.weight)
+
+    def optim_param_groups(self):
+        return {'muon': list(self.parameters())}
+    
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
+        # x = self.c_fc(x)
+        # x = F.relu(x).square()
+        # x = self.c_proj(x)
+        x = mlp_forward(x, self.c_fc.weight, self.c_proj.weight)
         return x
 
 
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        if False:
+            self.attn = CausalSelfAttention(config, layer_idx)
+        else:
+            self.attn = CausalSelfLinearAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def init_weights(self):
+        self.attn.init_weights()
+        self.mlp.init_weights()
+
+    def optim_param_groups(self):
+        g1 = self.attn.optim_param_groups()
+        g2 = self.mlp.optim_param_groups()
+        keys = set(g1.keys()) | set(g2.keys())
+        return {key: g1.get(key, []) + g2.get(key, []) for key in keys}
+    
+    def forward(self, x, ve, cos_sin, window_size, state_cache):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, state_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -222,12 +495,7 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)  # 0.4x init scale for c_fc
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            block.init_weights()
 
         # Per-layer scalars
         # Per-layer resid init: stronger residual at early layers, weaker at deep layers
@@ -238,19 +506,9 @@ class GPT(nn.Module):
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
 
-        # Smear/backout scalars and smear gate must be explicitly initialized 
-        torch.nn.init.zeros_(self.smear_lambda)
-        torch.nn.init.constant_(self.backout_lambda, 0.2)
-        torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
-
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
-
-        # Gate weights init with small positive values so gates start slightly above neutral
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -376,14 +634,25 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        special_params = [] # separate list for AdamW parameters that need special treatment
+        matrix_params = [] # separate list for Muon parameters
+        for block in self.transformer.h:
+            block_groups = block.optim_param_groups()
+            for kind, params in block_groups.items():
+                if kind == 'adamw':
+                    special_params.extend(params)
+                elif kind == 'muon':
+                    matrix_params.extend(params)
+                else:
+                    raise ValueError(f"Unknown optimizer kind: {kind}")
+                
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
+        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params) + len(special_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -398,6 +667,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=special_params, lr=3e-4 * dmodel_lr_scale, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -413,7 +683,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, state_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -421,7 +691,7 @@ class GPT(nn.Module):
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        T0 = 0 if state_cache is None else state_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
 
         # Embed the tokens
@@ -430,15 +700,15 @@ class GPT(nn.Module):
         x = norm(x)
 
         # Smear: mix previous token's embedding into current position (cheap bigram info)
-        if kv_cache is None:
+        if state_cache is None:
             # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
             x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
         else:
             # KV cache inference: read prev embedding from cache, store current for next step
-            x_pre_smear = kv_cache.prev_embedding
-            kv_cache.prev_embedding = x[:, -1:, :]
+            x_pre_smear = state_cache.prev_embedding
+            state_cache.prev_embedding = x[:, -1:, :]
             if T > 1:
                 # Prefill: apply smear to positions 1+, same as training
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
@@ -456,13 +726,15 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], state_cache)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
         if x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
+        if state_cache is not None:
+            state_cache.advance(T)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
