@@ -1,5 +1,81 @@
 # nanochat
 
+## What's in this fork
+
+In this fork, a linear attention like mechanism, gated kernel attention, is made.  The formula for this attention can be read from the function gated_kernel_attention_naive in nanochat/gated_kernel_attention.py.  Currently it only supports head dimension of 64.
+
+## Running script
+The script is modified from speedrun.sh and for running on Colab machine with one GPU.
+```
+%%shell
+#!/bin/bash
+
+git clone https://github.com/sunnysfwong/nanochat_gka.git
+cd nanochat_gka/
+
+export OMP_NUM_THREADS=1
+export NANOCHAT_BASE_DIR="/content/drive/MyDrive/nanochat/"
+mkdir -p $NANOCHAT_BASE_DIR
+
+# SKIP_SETUP=1
+# Setup (skip with SKIP_SETUP=1)
+if [ -z "$SKIP_SETUP" ]; then
+    pip install rustbpe tokenizers sentencepiece matplotlib scipy
+
+    # Tokenizer, download shards for pretraining
+    python -m nanochat.dataset -n 40
+    # python -m nanochat.dataset -n 200
+    python -m scripts.tok_train --max-chars=2000000000 --vocab-size=32768
+fi
+
+# Series name: from arg, env var, or default to today's date (e.g., jan11)
+SERIES_NAME="${1:-${SERIES_NAME:-$(date +%b%d | tr '[:upper:]' '[:lower:]')}}"
+# Depths to train (the "miniseries") (not used)
+DEPTHS=(6)
+d=6
+# Hardware
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+# Logging
+WANDB_RUN=dummy
+
+RESULTS_DIR="/content/drive/MyDrive/nanochat/${SERIES_NAME}_miniseries_results"
+mkdir -p "$RESULTS_DIR"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "=============================================="
+log "${SERIES_NAME} Training"
+log "=============================================="
+
+TAG="${SERIES_NAME}_d6"
+log "Training ${TAG}"
+
+# Train the model
+
+python -u -m scripts.base_train \
+    --depth=6 \
+    --device-batch-size=16 \
+    --total-batch-size=262144 \
+    --num-iterations=929 \
+    --max-seq-len=2048 \
+    --head-dim=64 \
+    --matrix-lr=0.02 \
+    --window-pattern=L \
+    --run=dummy \
+    --model-tag="${TAG}" \
+    --core-metric-every=-1 \
+    --core-metric-max-per-task=-1 \
+    --sample-every=-1 \
+    --eval-every=999999 \
+    --save-every=-1 \
+    --log-every=10 \
+    2>&1 | tee -a "${RESULTS_DIR}/${TAG}_train.log"
+```
+
+## README from original fork
+
 ![nanochat logo](dev/nanochat.png)
 ![scaling laws](dev/scaling_laws_jan26.png)
 
